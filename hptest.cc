@@ -1,9 +1,7 @@
 #include <deal.II/base/function.h>
 #include <deal.II/base/quadrature_lib.h>
-#include <deal.II/base/utilities.h>
-#include <deal.II/lac/generic_linear_algebra.h>
 #include <deal.II/base/timer.h>
-#include <deal.II/dofs/dof_accessor.h>
+#include <deal.II/base/utilities.h>
 #include <deal.II/dofs/dof_handler.h>
 #include <deal.II/dofs/dof_tools.h>
 #include <deal.II/fe/fe_q.h>
@@ -13,6 +11,7 @@
 #include <deal.II/lac/affine_constraints.h>
 #include <deal.II/lac/dynamic_sparsity_pattern.h>
 #include <deal.II/lac/full_matrix.h>
+#include <deal.II/lac/petsc_precondition.h>
 #include <deal.II/lac/petsc_snes.h>
 #include <deal.II/lac/petsc_sparse_matrix.h>
 #include <deal.II/lac/petsc_vector.h>
@@ -20,11 +19,16 @@
 #include <deal.II/numerics/data_out.h>
 #include <deal.II/numerics/error_estimator.h>
 #include <deal.II/numerics/matrix_tools.h>
+#include <deal.II/numerics/solution_transfer.h>
 #include <deal.II/numerics/vector_tools.h>
-#include "tests.h"
-#include <deal.II/base/conditional_ostream.h>
+#include <deal.II/distributed/grid_refinement.h>
+#include <deal.II/distributed/solution_transfer.h>
 #include <deal.II/distributed/tria.h>
 #include <deal.II/grid/grid_tools.h>
+#include <deal.II/lac/generic_linear_algebra.h>
+#include <deal.II/dofs/dof_accessor.h>
+#include "tests.h"
+#include <deal.II/base/conditional_ostream.h>
 #include <iostream>
 #include <deal.II/lac/solver_cg.h>
 #include <deal.II/base/index_set.h>
@@ -53,21 +57,23 @@
 #include <string>
 #include <map>
 #include <iomanip>
-#include <deal.II/distributed/grid_refinement.h>
 #include <deal.II/base/logstream.h>
 #include <deal.II/grid/tria_accessor.h>
 #include <deal.II/grid/grid_generator.h>
-#include <deal.II/grid/grid_tools.h>
 #include <deal.II/differentiation/sd/symengine_math.h>
 #include <deal.II/fe/mapping_fe_field.h>
 #include <deal.II/fe/mapping_manifold.h>
 #include <locale>
 #include <deal.II/base/symmetric_tensor.h>
+
+
 namespace HP_ALE
 {
   using namespace dealii;
   using VectorType         = PETScWrappers::MPI::Vector;
   using MatrixType         = PETScWrappers::MPI::SparseMatrix;
+  using PreconditionerType = PETScWrappers::PreconditionBoomerAMG;
+  using PreconditionerType = PETScWrappers::PreconditionBoomerAMG;
   using NonlinearSolver =
        PETScWrappers::NonlinearSolver<VectorType, MatrixType>;
   enum class TestCase
@@ -181,6 +187,7 @@ namespace HP_ALE
     std::vector<bool> constrainted_flag;
 
     MatrixType jacobian_matrix;
+    PreconditionerType jacobian_matrix_factorization;
     MatrixType volume_system_matrix;
 
     VectorType solution;         // newton, n+1  t=m
@@ -197,7 +204,7 @@ namespace HP_ALE
     VectorType dis_volume_old_solution;
 
     VectorType volume_system_rhs;
-    VectorType system_residual;
+    //VectorType residual;
 
     std::unique_ptr<MappingQ<dim>> mapping_pointer;
     hp::MappingCollection<dim>     mapping_collection;
@@ -236,8 +243,6 @@ namespace HP_ALE
       FEFaceValues<dim>    hydrogel_fe_face_values;    //
       FESubfaceValues<dim> stokes_fe_subface_values;   // gamma1
       FESubfaceValues<dim> hydrogel_fe_subface_values; // gamma1
-
-
 
       hp::FEValues<dim>    volume_fe_values;
       FEFaceValues<dim>    volume_fe_face_values;
@@ -396,12 +401,16 @@ namespace HP_ALE
     compute_hp_jacobian_matrix(const VectorType &evaluation_point);
 
     void
+    compute_jacobian_and_initialize_preconditioner(
+              const VectorType &evaluation_point);
+
+    void
     assemble_local_hp_rhs(
               const typename DoFHandler<dim>::active_cell_iterator &cell,
               ScratchData &                                         scratch,
               PerTaskData &                                         copy_data);
     void
-    copy_local_to_global_hp_rhs(const PerTaskData &copy_data);
+    copy_local_to_global_hp_rhs(const PerTaskData &copy_data, VectorType &residual);
     void
     compute_hp_residual(const VectorType &evaluation_point, VectorType & residual);
 
@@ -418,7 +427,7 @@ namespace HP_ALE
     void
     solve_volume();
     void
-    solve_hp();
+    solve(const VectorType &rhs, VectorType &solution);
   };
 
 //no need to modify
@@ -601,7 +610,7 @@ namespace HP_ALE
               const SphericalManifold<2> manifold(center);
               GridIn<2> gridin;
               gridin.attach_triangulation(triangulation);
-              std::ifstream f("/home/lexlee/parallelmpi/example.msh");
+              std::ifstream f("/Users/lexlee/Downloads/hptest_mpi/example.msh");
               gridin.read_msh(f);
 
               triangulation.reset_all_manifolds();
@@ -732,14 +741,11 @@ namespace HP_ALE
                                     sp,
                                     mpi_communicator);
         volume_system_rhs.reinit(volume_locally_owned_dofs, mpi_communicator);
-
-
     }
 
     {
       const unsigned int n_components_total = fe_collection.n_components();
       dof_handler.distribute_dofs(fe_collection);
-
       std::vector<unsigned int> block_component(n_components_total, 0);
       for (unsigned int d = dim; d < n_components_total; ++d)
         {
@@ -757,8 +763,6 @@ namespace HP_ALE
 
       // renumbering
       DoFRenumbering::Cuthill_McKee(dof_handler);
-
-
         const std::vector<types::global_dof_index> dofs_per_block =
                 DoFTools::count_dofs_per_fe_block(dof_handler, block_component);
 
@@ -1011,8 +1015,8 @@ namespace HP_ALE
                              hp_index_set,
                              dsp,
                              mpi_communicator);
-        system_residual.reinit(hp_index_set,
-                        mpi_communicator);
+        /*residual.reinit(hp_index_set,
+                        mpi_communicator);*/
 
     }
 
@@ -1033,14 +1037,23 @@ namespace HP_ALE
     for (unsigned int c = 0; c < fe_collection.n_components(); ++c)
       for (unsigned int d = 0; d < fe_collection.n_components(); ++d)
         {
-          if (((c < dim) && (d < 2 * dim)) ||
+          /*if (((c < dim) && (d < 2 * dim)) ||
               (((c > dim - 1) && (c < 2 * dim)) && (d < (3 * dim + 1))) ||
               (((c > dim + 1) && (c < 3 * dim)) &&
                ((d > dim - 1) && (d < 3 * dim + 1))) ||
               ((c == 3 * dim) && ((d > dim - 1) && (d < 3 * dim))) ||
               (((c > 3 * dim) && (c < 4 * dim + 1)) && (d > 3 * dim)) ||
               ((c == 4 * dim + 1) && ((d > 3 * dim) && (d < 4 * dim + 1))))
-            cell_coupling[c][d] = DoFTools::always;
+            cell_coupling[c][d] = DoFTools::always;*/
+
+            if (((c < dim) && (d < 2 * dim)) ||
+                (((c > dim - 1) && (c < 2 * dim)) && (d < (3 * dim + 1))) ||
+                (((c > dim + 1) && (c < 3 * dim)) &&
+                 ((d > dim - 1) && (d < 3 * dim + 1))) ||
+                ((c == 3 * dim) && ((d > dim - 1) && (d < 3 * dim + 1))) ||
+                (((c > 3 * dim) && (c < 4 * dim + 1)) && (d > 3 * dim)) ||
+                ((c == 4 * dim + 1) && ((d > 3 * dim) && (d < 4 * dim + 2))))
+                cell_coupling[c][d] = DoFTools::always;
 
             // face coupling,boundary condition #2
 
@@ -1769,6 +1782,8 @@ namespace HP_ALE
                                 scalar_product(inv_F_T, grad_shape_stokes_velocity[j]) *
                                 shape_stokes_pressure[i] + // A'_6
 
+                                0.*shape_stokes_pressure[j] * shape_stokes_pressure[i] +
+
                                 alpha *
                                 scalar_product(grad_shape_displacement[j],
                                                grad_shape_displacement[i]) *
@@ -1902,6 +1917,8 @@ namespace HP_ALE
                                          volume_s[q] *
                                          shape_grad_vs[i]), // \phi_s * grad shape_vs
                                         inv_F_T) +            // A'_5
+
+                                0. * shape_hydrogel_pressure[i] * shape_hydrogel_pressure[j] +
 
                                 jacoiban *
                                 scalar_product(
@@ -2147,7 +2164,6 @@ namespace HP_ALE
                     } // face loop
                 }
         } // hydrogel domain
-
     }
   }
 
@@ -2197,7 +2213,8 @@ namespace HP_ALE
         pcout << "compute jacobian matrix" << std::endl;
         jacobian_matrix = 0.;
         //current_solution = evaluation_point;
-        (void)evaluation_point;
+        //(void)evaluation_point;
+        current_solution = evaluation_point;
         using CellFilter =
                 FilteredIterator<typename DoFHandler<2>::active_cell_iterator>;
         const QGauss<dim> quadrature_formula(2 + 2 * velocity_degree);
@@ -2246,7 +2263,16 @@ namespace HP_ALE
                                    worker, copier, sd, cp);
 
         jacobian_matrix.compress(VectorOperation::add);
-        //pcout << "jacobian matrix NORM=" << jacobian_matrix.linfty_norm() <<  std::endl;
+        pcout << "jacobian matrix NORM2=" << jacobian_matrix.linfty_norm() <<  std::endl;
+    }
+
+    template <int dim>
+    void
+    FluidStructureProblem<dim>::compute_jacobian_and_initialize_preconditioner(
+            const VectorType &evaluation_point)
+    {
+        compute_hp_jacobian_matrix(evaluation_point);
+        jacobian_matrix_factorization.initialize(jacobian_matrix);
     }
 
     template <int dim>
@@ -2715,47 +2741,12 @@ namespace HP_ALE
 
     template <int dim>
     void
-    FluidStructureProblem<dim>::copy_local_to_global_hp_rhs(
-            const PerTaskData &copy_data)
-    {
-            constraints_newton_update.distribute_local_to_global(
-                    copy_data.cell_rhs, copy_data.local_dof_indices, system_residual);
-            if (copy_data.assemble_interface)
-            {
-                //(stokes,stokes)
-                constraints_newton_update.distribute_local_to_global(
-                        copy_data.interface_rhs1,
-                        copy_data.neighbor_dof_indices,
-                        system_residual);
-                //(stokes,hydrogel)
-                constraints_newton_update.distribute_local_to_global(
-                        copy_data.interface_rhs2,
-                        copy_data.local_dof_indices,
-                        system_residual);
-                //(hydrogel,stokes)
-                constraints_newton_update.distribute_local_to_global(
-                        copy_data.interface_rhs3,
-                        copy_data.neighbor_dof_indices,
-                        system_residual);
-                //(hydrogel,hydrogel)
-                constraints_newton_update.distribute_local_to_global(
-                        copy_data.interface_rhs4,
-                        copy_data.local_dof_indices,
-                        system_residual);
-            }
-    }
-
-    template <int dim>
-    void
     FluidStructureProblem<dim>::compute_hp_residual(const VectorType &evaluation_point,
                                                     VectorType &      residual)
     {
         pcout << "compute residual" << std::endl;
-        system_residual = 0.;
-
-        dis_current_solution = evaluation_point;
-        constraints_hp.distribute(dis_current_solution);
-        current_solution = dis_current_solution;
+        residual = 0.;
+        current_solution = evaluation_point;
 
         const QGauss<dim> quadrature_formula(2 + 2 * velocity_degree);
         // same quadrature for all
@@ -2796,8 +2787,8 @@ namespace HP_ALE
                     PerTaskData &                                         copy_data) {
                     this->assemble_local_hp_rhs(cell, scratch, copy_data);
                 };
-        auto copier = [this](const PerTaskData &copy_data) {
-             this->copy_local_to_global_hp_rhs(copy_data);
+        auto copier = [this, &residual](const PerTaskData &copy_data) {
+             this->copy_local_to_global_hp_rhs(copy_data, residual);
         };
 
         WorkStream::run(CellFilter(IteratorFilters::LocallyOwnedCell(),
@@ -2806,10 +2797,47 @@ namespace HP_ALE
                                    dof_handler.end()),
                                    worker, copier, sd, cp);
 
+        residual.compress(VectorOperation::add);
+        pcout << " compute part residual norm=" << residual.l2_norm() << std::endl;
+    }
 
-        system_residual.compress(VectorOperation::add);
+    template <int dim>
+    void
+    FluidStructureProblem<dim>::copy_local_to_global_hp_rhs(
+            const PerTaskData &copy_data, VectorType &residual)
+    {
+        constraints_newton_update.distribute_local_to_global(
+                copy_data.cell_rhs, copy_data.local_dof_indices, residual);
+        if (copy_data.assemble_interface)
+        {
+            //(stokes,stokes)
+            constraints_newton_update.distribute_local_to_global(
+                    copy_data.interface_rhs1,
+                    copy_data.neighbor_dof_indices,
+                    residual);
+            //(stokes,hydrogel)
+            constraints_newton_update.distribute_local_to_global(
+                    copy_data.interface_rhs2,
+                    copy_data.local_dof_indices,
+                    residual);
+            //(hydrogel,stokes)
+            constraints_newton_update.distribute_local_to_global(
+                    copy_data.interface_rhs3,
+                    copy_data.neighbor_dof_indices,
+                    residual);
+            //(hydrogel,hydrogel)
+            constraints_newton_update.distribute_local_to_global(
+                    copy_data.interface_rhs4,
+                    copy_data.local_dof_indices,
+                    residual);
+        }
+    }
 
-        pcout << " compute part residual norm=" << system_residual.l2_norm() << std::endl;
+    template <int dim>
+    void
+    FluidStructureProblem<dim>::solve(const VectorType &rhs, VectorType &solution)
+    {
+        jacobian_matrix_factorization.vmult(solution, rhs);
     }
 
 
@@ -2908,38 +2936,50 @@ namespace HP_ALE
     uint         step       = 0;
     double       time       = 0.;
     const double final_time = 20.0;//20000. * static_cast<double>(time_step);
-        pcout << "\n step: " << step << " time: " << time << std::endl;
-        assemble_volume_system_workstream();
-        solve_volume();// volume solution = dis volume
-         pcout << "solving hp system" << std::endl;
+    pcout << "\n step: " << step << " time: " << time << std::endl;
+    assemble_volume_system_workstream();
+    solve_volume();// volume solution = dis volume
+    pcout << "solving hp system" << std::endl;
 
-              const double target_tolerance = 1e-10;
-              pcout << "  Target_tolerance: " << target_tolerance << std::endl;
-              PETScWrappers::NonlinearSolverData additional_data;
-              additional_data.absolute_tolerance = target_tolerance;
-              NonlinearSolver nonlinear_solver(additional_data,mpi_communicator);
-              pcout << "jacobian_matrix norm" << jacobian_matrix.linfty_norm() << std::endl;
-              nonlinear_solver.residual = [&](const VectorType &evaluation_point,
+    const double target_tolerance = 1e-10;
+    pcout << "  Target_tolerance: " << target_tolerance << std::endl;
+    PETScWrappers::NonlinearSolverData additional_data;
+    additional_data.absolute_tolerance = target_tolerance;
+    NonlinearSolver nonlinear_solver(additional_data,mpi_communicator);
+    pcout << "jacobian_matrix norm" << jacobian_matrix.linfty_norm() << std::endl;
+    nonlinear_solver.residual = [&](const VectorType &evaluation_point,
                                               VectorType &      residual){
-                  compute_hp_residual(evaluation_point, residual);
-                  residual = system_residual;
+        compute_hp_residual(evaluation_point, residual);
               };
-
-              {
-                  nonlinear_solver.set_matrix(jacobian_matrix);
-                  nonlinear_solver.jacobian =
-                          [&](const VectorType &current_u, MatrixType &, MatrixType &P) {
-                              Assert(P == jacobian_matrix, ExcInternalError());
-                              compute_hp_jacobian_matrix(current_u);
-                              (void)P;
-                          };
-              }
-              nonlinear_solver.monitor =
+    bool user_control = false;
+      if (user_control)
+      {
+          nonlinear_solver.setup_jacobian =
+                  [&](const VectorType &current_u) {
+                      compute_jacobian_and_initialize_preconditioner(current_u);
+                  };
+          nonlinear_solver.solve_with_jacobian = [&](const VectorType &rhs,
+                                                     VectorType &dst) {
+              this->solve(rhs, dst);
+          };
+          //nonlinear_solver.set_matrix(jacobian_matrix);
+      }
+      else  //jacobian-free newton-krylov
+      {
+          nonlinear_solver.set_matrix(jacobian_matrix);
+          nonlinear_solver.jacobian =
+                  [&](const VectorType &current_u, MatrixType &, MatrixType &P) {
+                      Assert(P == jacobian_matrix, ExcInternalError());
+                      compute_hp_jacobian_matrix(current_u);
+                      (void)P;
+                  };
+      }
+      nonlinear_solver.monitor =
                       [&](const VectorType &, unsigned int step, double gnorm) {
                           pcout << step << " norm=" << gnorm << std::endl;
                       };
-              nonlinear_solver.solve(dis_current_solution);
-              constraints_hp.distribute(dis_current_solution);
+      nonlinear_solver.solve(dis_current_solution);
+      constraints_hp.distribute(dis_current_solution);
 
          // dis_volume_old_solution = dis_volume_solution;
          // volume_old_solution = dis_volume_old_solution;
@@ -2962,7 +3002,7 @@ int main(int argc, char *argv[])
   try
     {
       using namespace HP_ALE;
-        Utilities::MPI::MPI_InitFinalize mpi_initialization(argc, argv, 64);
+        Utilities::MPI::MPI_InitFinalize mpi_initialization(argc, argv, 1);
       const TestCase test_case = TestCase::case_1;
 
       FluidStructureProblem<2> flow_problem(2, 1, 2, test_case);
