@@ -1782,7 +1782,7 @@ namespace HP_ALE
                                 scalar_product(inv_F_T, grad_shape_stokes_velocity[j]) *
                                 shape_stokes_pressure[i] + // A'_6
 
-                                0.*shape_stokes_pressure[j] * shape_stokes_pressure[i] +
+                                1.*shape_stokes_pressure[j] * shape_stokes_pressure[i] +
 
                                 alpha *
                                 scalar_product(grad_shape_displacement[j],
@@ -1918,7 +1918,7 @@ namespace HP_ALE
                                          shape_grad_vs[i]), // \phi_s * grad shape_vs
                                         inv_F_T) +            // A'_5
 
-                                0. * shape_hydrogel_pressure[i] * shape_hydrogel_pressure[j] +
+                                1. * shape_hydrogel_pressure[i] * shape_hydrogel_pressure[j] +
 
                                 jacoiban *
                                 scalar_product(
