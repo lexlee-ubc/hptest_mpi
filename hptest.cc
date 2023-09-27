@@ -577,7 +577,7 @@ namespace HP_ALE
         {
             GridIn<2> gridin;
             gridin.attach_triangulation(triangulation);
-            std::ifstream f("/Users/lexlee/Downloads/matrixcompare/simplemesh.msh");
+            std::ifstream f("/Users/lexlee/Downloads/hptest_mpi/example.msh");
             gridin.read_msh(f);
             // set material id:
             for (const auto &cell : dof_handler.active_cell_iterators())
@@ -2141,10 +2141,7 @@ namespace HP_ALE
         pcout << "compute jacobian matrix" << std::endl;
         jacobian_matrix = 0.;
 
-        dis_current_solution = evaluation_point;
-        constraints_hp.distribute(dis_current_solution);
-        current_solution = dis_current_solution;
-        old_solution = dis_old_solution;
+        current_solution = evaluation_point;
 
         using CellFilter =
                 FilteredIterator<typename DoFHandler<2>::active_cell_iterator>;
@@ -2193,17 +2190,6 @@ namespace HP_ALE
                                    worker, copier, sd, cp);
 
         jacobian_matrix.compress(VectorOperation::add);
-        std::map<types::global_dof_index, double> boundary_values;
-        VectorTools::interpolate_boundary_values(dof_handler,
-                                                 0,
-                                                 Functions::ZeroFunction<dim>(),
-                                                 boundary_values);
-        Vector<double> dummy_solution(dof_handler.n_dofs());
-        Vector<double> dummy_rhs(dof_handler.n_dofs());
-        /*PETScWrappers::MatrixBase::MatrixTools::apply_boundary_values(boundary_values,
-                                           jacobian_matrix,
-                                           dummy_solution,
-                                           dummy_rhs);*/
 
         pcout << "Number of non-zero elements: " << jacobian_matrix.n_nonzero_elements() << std::endl;
         pcout << "jacobian matrix NORM2=" << jacobian_matrix.linfty_norm() <<  std::endl;
@@ -2720,10 +2706,7 @@ namespace HP_ALE
         pcout << "compute residual" << std::endl;
         residual = 0.;
 
-        dis_current_solution = evaluation_point;
-        constraints_hp.distribute(dis_current_solution);
-        current_solution = dis_current_solution;
-        old_solution = dis_old_solution;
+        current_solution = evaluation_point;
 
         const QGauss<dim> quadrature_formula(2 + 2 * velocity_degree);
         // same quadrature for all
@@ -2789,17 +2772,18 @@ namespace HP_ALE
     void
     FluidStructureProblem<dim>::nonlinear_solve()
     {
-        old_solution = dis_old_solution;
+        //old_solution = dis_old_solution;
         dis_current_solution = dis_old_solution;
         current_solution = dis_current_solution;
         current_solution = old_solution;
         constraints_hp.distribute(dis_current_solution);
+        current_solution = dis_current_solution;
 
         const double target_tolerance = 1.e-8;
         PETScWrappers::NonlinearSolverData additional_data;
         additional_data.absolute_tolerance = target_tolerance;
-        additional_data.snes_linesearch_type = "l2" ;
-        additional_data.snes_type =  "vinewtonrsls"  ;
+        additional_data.snes_linesearch_type = "basic" ;
+        additional_data.snes_type =  "ngmres"  ;
 
         NonlinearSolver nonlinear_solver(additional_data,mpi_communicator);
         nonlinear_solver.residual = [&](const VectorType &evaluation_point,
@@ -2836,6 +2820,7 @@ namespace HP_ALE
                 };
 
         nonlinear_solver.solve(dis_current_solution);
+        constraints_hp.distribute(dis_current_solution);
     }
 
 
